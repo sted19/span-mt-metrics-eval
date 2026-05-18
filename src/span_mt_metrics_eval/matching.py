@@ -13,7 +13,7 @@ from typing import Callable
 
 import numpy as np
 
-from span_mt_metaeval_metrics.types import ErrorSpan, Measure
+from span_mt_metrics_eval.types import ErrorSpan, Measure
 
 MatchPairs = list[tuple[int, int]]
 _LINEAR_SUM_ASSIGNMENT = None

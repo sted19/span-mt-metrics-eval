@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "span-mt-metaeval-metrics"
+name = "span-mt-metrics-eval"
 version = "0.1.0"
 description = "Standalone span-level precision, recall, and F-score metrics for MT error annotations"
 readme = "README.md"

@@ -1,4 +1,4 @@
-# span-mt-metaeval-metrics
+# span-mt-metrics-eval
 
 Standalone Python package for span-level precision, recall, and F-score metrics
 for machine translation error annotations.
@@ -32,7 +32,7 @@ After this directory is pushed to GitHub, it can be installed directly from the
 repository:
 
 ```bash
-python -m pip install "span-mt-metaeval-metrics @ git+https://github.com/<OWNER>/span-mt-metaeval-metrics.git"
+python -m pip install "span-mt-metrics-eval @ git+https://github.com/<OWNER>/span-mt-metrics-eval.git"
 ```
 
 The package depends on NumPy. SciPy is optional; when installed, it is used for
@@ -46,7 +46,7 @@ python -m pip install ".[speed]"
 ## Quick Start
 
 ```python
-from span_mt_metaeval_metrics import compute
+from span_mt_metrics_eval import compute
 
 predictions = [
     {"start": 8, "end": 13, "side": "target"},
@@ -96,7 +96,7 @@ references = [
 Each span can be a dictionary or an `ErrorSpan` instance:
 
 ```python
-from span_mt_metaeval_metrics import ErrorSpan
+from span_mt_metrics_eval import ErrorSpan
 
 span = ErrorSpan(start=0, end=5, side="source")
 ```

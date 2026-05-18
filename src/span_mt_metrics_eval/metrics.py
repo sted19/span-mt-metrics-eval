@@ -17,14 +17,14 @@ import logging
 
 import numpy as np
 
-from span_mt_metaeval_metrics.matching import (
+from span_mt_metrics_eval.matching import (
     MatchPairs,
     find_greedy_matches,
     find_optimal_matches,
     overlap_length,
     spans_exactly_match,
 )
-from span_mt_metaeval_metrics.types import (
+from span_mt_metrics_eval.types import (
     AVERAGING_STRATEGIES,
     MATCHING_ALGORITHMS,
     MATCHING_STRATEGIES,

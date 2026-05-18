@@ -1,7 +1,7 @@
 """Span-level MT meta-evaluation metrics."""
 
-from span_mt_metaeval_metrics.metrics import compute
-from span_mt_metaeval_metrics.types import (
+from span_mt_metrics_eval.metrics import compute
+from span_mt_metrics_eval.types import (
     AVERAGING_STRATEGIES,
     MATCHING_ALGORITHMS,
     MATCHING_STRATEGIES,
