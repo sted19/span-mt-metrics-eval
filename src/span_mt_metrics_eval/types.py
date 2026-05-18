@@ -28,13 +28,14 @@ class ErrorSpan:
 
     Offsets follow the Python slicing convention: ``start`` is included and
     ``end`` is excluded. All metrics use these offsets as the authoritative span
-    length, so optional text/category/severity fields in user dictionaries are
-    intentionally ignored by this data type.
+    length. ``severity`` is optional unless the caller enables a non-zero
+    severity penalty during metric computation.
     """
 
     start: int
     end: int
     side: Literal["source", "target"] = "target"
+    severity: str | None = None
 
     def __post_init__(self) -> None:
         """Validate offsets and normalize the side after dataclass creation.
@@ -47,11 +48,13 @@ class ErrorSpan:
         _validate_offset(self.start, "start")
         _validate_offset(self.end, "end")
         normalized_side = _normalize_side(self.side)
+        normalized_severity = _normalize_severity(self.severity)
 
         if self.start >= self.end:
             raise ValueError(f"Invalid span ({self.start}, {self.end}): start must be < end")
 
         object.__setattr__(self, "side", normalized_side)
+        object.__setattr__(self, "severity", normalized_severity)
 
     @property
     def length(self) -> int:
@@ -70,9 +73,9 @@ class ErrorSpan:
         """Create an ErrorSpan from an ErrorSpan or user-provided dictionary.
 
         The accepted dictionary shape is intentionally permissive: users may
-        provide either ``side`` or the WMT-style ``is_source_error`` flag, and
-        extra fields such as category or severity are ignored. The method returns
-        a validated ``ErrorSpan``.
+        provide either ``side`` or the WMT-style ``is_source_error`` flag.
+        Optional ``severity`` values are normalized for severity-aware scoring.
+        The method returns a validated ``ErrorSpan``.
         """
 
         if isinstance(value, ErrorSpan):
@@ -92,7 +95,12 @@ class ErrorSpan:
             else:
                 side = "target"
                 logger.warning("Span dictionary is missing 'side'; defaulting to 'target'")
-            return cls(start=start, end=end, side=side)
+            return cls(
+                start=start,
+                end=end,
+                side=side,
+                severity=value.get("severity"),
+            )
 
         raise TypeError(
             "Spans must be ErrorSpan instances or dictionaries"
@@ -148,8 +156,9 @@ class MetricConfig:
     matching: MatchingStrategy
     matching_algorithm: MatchingAlgorithm | None
     averaging: AveragingStrategy
+    severity_penalty: float = 0.0
 
-    def as_dict(self) -> dict[str, str | None]:
+    def as_dict(self) -> dict[str, str | float | None]:
         """Return a JSON-serializable representation of the metric options."""
 
         return {
@@ -157,6 +166,7 @@ class MetricConfig:
             "matching": self.matching,
             "matching_algorithm": self.matching_algorithm,
             "averaging": self.averaging,
+            "severity_penalty": self.severity_penalty,
         }
 
 
@@ -225,3 +235,20 @@ def _normalize_side(value: Any) -> Literal["source", "target"]:
     if normalized in {"target", "tgt", "translation"}:
         return "target"
     raise ValueError(f"Invalid span side {value!r}; expected 'source' or 'target'")
+
+
+def _normalize_severity(value: Any) -> str | None:
+    """Normalize an optional severity label.
+
+    ``None`` and blank strings are treated as missing severity. Non-empty string
+    labels are stripped and lowercased so callers can use flexible labels while
+    still getting deterministic equality checks during scoring.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError("Span severity must be a string when provided")
+
+    normalized = value.strip().lower()
+    return normalized or None

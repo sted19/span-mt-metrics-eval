@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterable, Sequence
+from numbers import Real
 from typing import Any
 import logging
 
@@ -22,6 +23,7 @@ from span_mt_metrics_eval.matching import (
     find_greedy_matches,
     find_optimal_matches,
     overlap_length,
+    severity_reward,
     spans_exactly_match,
 )
 from span_mt_metrics_eval.types import (
@@ -49,6 +51,7 @@ def compute(
     matching: MatchingStrategy = "one_to_one",
     matching_algorithm: MatchingAlgorithm = "optimal",
     averaging: AveragingStrategy = "micro",
+    severity_penalty: float = 0.0,
     source_texts: str | list[str] | None = None,
     target_texts: str | list[str] | None = None,
 ) -> MetricResult | dict[Measure, MetricResult]:
@@ -60,15 +63,17 @@ def compute(
 
     The metric is selected with ``measure``. Passing ``measure="all"`` returns a
     dictionary with one ``MetricResult`` per metric; otherwise this function
-    returns a single ``MetricResult``. Optional text inputs are currently kept in
-    the signature for users who want to pass source/target context alongside
-    offsets.
+    returns a single ``MetricResult``. ``severity_penalty`` discounts matches
+    whose normalized severity labels differ. Optional text inputs are currently
+    kept in the signature for users who want to pass source/target context
+    alongside offsets.
     """
 
     _validate_measure(measure)
     _validate_matching(matching)
     _validate_matching_algorithm(matching_algorithm)
     _validate_averaging(averaging)
+    severity_penalty = _validate_severity_penalty(severity_penalty)
 
     if measure == "all":
         result = {
@@ -79,6 +84,7 @@ def compute(
                 matching=matching,
                 matching_algorithm=matching_algorithm,
                 averaging=averaging,
+                severity_penalty=severity_penalty,
                 source_texts=source_texts,
                 target_texts=target_texts,
             )
@@ -96,6 +102,10 @@ def compute(
             "predictions and references must contain the same number of elements"
             f"({len(predictions)} != {len(references)})"
         )
+
+    if severity_penalty > 0.0:
+        _validate_required_severities(predictions, "predictions")
+        _validate_required_severities(references, "references")
 
     source_text_list = (
         _coerce_texts(source_texts, len(predictions), "source_texts")
@@ -122,6 +132,7 @@ def compute(
             measure=measure,
             matching=matching,
             matching_algorithm=matching_algorithm,
+            severity_penalty=severity_penalty,
         )
         for segment_predictions, segment_references in zip(predictions, references)
     ]
@@ -134,6 +145,7 @@ def compute(
             matching_algorithm if matching == "one_to_one" else None
         ),
         averaging=averaging,
+        severity_penalty=severity_penalty,
     )
 
     if averaging == "micro":
@@ -163,6 +175,7 @@ def _compute_tp_counts(
     measure: Measure,
     matching: MatchingStrategy,
     matching_algorithm: MatchingAlgorithm,
+    severity_penalty: float,
 ) -> TPCounts:
     """Compute one segment's raw counts for the requested matching strategy.
 
@@ -173,9 +186,9 @@ def _compute_tp_counts(
 
     if matching == "one_to_one":
         return _compute_o2o_tp_counts(
-            predictions, references, measure, matching_algorithm
+            predictions, references, measure, matching_algorithm, severity_penalty
         )
-    return _compute_m2m_tp_counts(predictions, references, measure)
+    return _compute_m2m_tp_counts(predictions, references, measure, severity_penalty)
 
 
 def _compute_o2o_tp_counts(
@@ -183,6 +196,7 @@ def _compute_o2o_tp_counts(
     references: list[ErrorSpan],
     measure: Measure,
     matching_algorithm: MatchingAlgorithm,
+    severity_penalty: float,
 ) -> TPCounts:
     """Compute one-to-one counts after choosing matched span pairs.
 
@@ -192,18 +206,28 @@ def _compute_o2o_tp_counts(
     """
 
     if matching_algorithm == "greedy":
-        matches = find_greedy_matches(predictions, references)
+        matches = find_greedy_matches(predictions, references, severity_penalty)
     else:
-        matches = find_optimal_matches(predictions, references, measure)
+        matches = find_optimal_matches(
+            predictions, references, measure, severity_penalty
+        )
 
     if measure == "EM":
-        return _compute_o2o_em_tp_counts(predictions, references, matches)
+        return _compute_o2o_em_tp_counts(
+            predictions, references, matches, severity_penalty
+        )
     if measure == "MP":
-        return _compute_o2o_mp_tp_counts(predictions, references, matches)
+        return _compute_o2o_mp_tp_counts(
+            predictions, references, matches, severity_penalty
+        )
     if measure == "WMT23":
-        return _compute_o2o_wmt23_tp_counts(predictions, references, matches)
+        return _compute_o2o_wmt23_tp_counts(
+            predictions, references, matches, severity_penalty
+        )
     if measure == "MPP":
-        return _compute_o2o_mpp_tp_counts(predictions, references, matches)
+        return _compute_o2o_mpp_tp_counts(
+            predictions, references, matches, severity_penalty
+        )
     raise ValueError(f"Unknown measure: {measure}")
 
 
@@ -211,22 +235,27 @@ def _compute_o2o_em_tp_counts(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
     matches: MatchPairs,
+    severity_penalty: float,
 ) -> TPCounts:
     """Compute exact-match counts for a one-to-one matching.
 
-    Inputs are the spans and already-selected match pairs. The output gives one
-    true positive only to pairs whose side and offsets are identical; all other
-    predictions/references are counted as false positives or false negatives.
+    Inputs are the spans and already-selected match pairs. Exact offset matches
+    receive full or severity-discounted credit; all remaining mass is counted as
+    false positives or false negatives.
     """
 
-    exact_matches = sum(
-        1.0 for pred_idx, ref_idx in matches if spans_exactly_match(predictions[pred_idx], references[ref_idx])
-    )
+    exact_match_credit = 0.0
+    for pred_idx, ref_idx in matches:
+        pred = predictions[pred_idx]
+        ref = references[ref_idx]
+        if spans_exactly_match(pred, ref):
+            exact_match_credit += severity_reward(pred, ref, severity_penalty)
+
     return TPCounts(
-        tp_for_precision=exact_matches,
-        tp_for_recall=exact_matches,
-        fp=float(len(predictions)) - exact_matches,
-        fn=float(len(references)) - exact_matches,
+        tp_for_precision=exact_match_credit,
+        tp_for_recall=exact_match_credit,
+        fp=float(len(predictions)) - exact_match_credit,
+        fn=float(len(references)) - exact_match_credit,
     )
 
 
@@ -234,19 +263,23 @@ def _compute_o2o_mp_tp_counts(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
     matches: MatchPairs,
+    severity_penalty: float,
 ) -> TPCounts:
     """Compute binary partial-overlap counts for a one-to-one matching.
 
-    Every selected pair has positive overlap and therefore receives one full
-    true positive on both the precision and recall side.
+    Every selected pair has positive overlap and receives full or
+    severity-discounted binary credit on both precision and recall sides.
     """
 
-    true_positives = float(len(matches))
+    true_positive_credit = sum(
+        severity_reward(predictions[pred_idx], references[ref_idx], severity_penalty)
+        for pred_idx, ref_idx in matches
+    )
     return TPCounts(
-        tp_for_precision=true_positives,
-        tp_for_recall=true_positives,
-        fp=float(len(predictions)) - true_positives,
-        fn=float(len(references)) - true_positives,
+        tp_for_precision=true_positive_credit,
+        tp_for_recall=true_positive_credit,
+        fp=float(len(predictions)) - true_positive_credit,
+        fn=float(len(references)) - true_positive_credit,
     )
 
 
@@ -254,12 +287,13 @@ def _compute_o2o_wmt23_tp_counts(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
     matches: MatchPairs,
+    severity_penalty: float,
 ) -> TPCounts:
     """Compute character-count ``WMT23`` counts for a one-to-one matching.
 
-    Overlapping characters in matched pairs are true positives. Uncovered
-    prediction characters become false positives, and uncovered reference
-    characters become false negatives.
+    Overlapping characters in matched pairs are true positives after applying
+    the severity reward. Unrewarded prediction/reference characters become
+    false positives and false negatives.
     """
 
     matched_by_prediction = {pred_idx: ref_idx for pred_idx, ref_idx in matches}
@@ -274,17 +308,23 @@ def _compute_o2o_wmt23_tp_counts(
         if ref_idx is None:
             false_positive_chars += pred.length
             continue
-        overlap = overlap_length(pred, references[ref_idx])
-        true_positive_chars += overlap
-        false_positive_chars += pred.length - overlap
+        ref = references[ref_idx]
+        overlap_reward = overlap_length(pred, ref) * severity_reward(
+            pred, ref, severity_penalty
+        )
+        true_positive_chars += overlap_reward
+        false_positive_chars += pred.length - overlap_reward
 
     for ref_idx, ref in enumerate(references):
         pred_idx = matched_by_reference.get(ref_idx)
         if pred_idx is None:
             false_negative_chars += ref.length
             continue
-        overlap = overlap_length(predictions[pred_idx], ref)
-        false_negative_chars += ref.length - overlap
+        pred = predictions[pred_idx]
+        overlap_reward = overlap_length(pred, ref) * severity_reward(
+            pred, ref, severity_penalty
+        )
+        false_negative_chars += ref.length - overlap_reward
 
     return TPCounts(
         tp_for_precision=true_positive_chars,
@@ -298,13 +338,12 @@ def _compute_o2o_mpp_tp_counts(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
     matches: MatchPairs,
+    severity_penalty: float,
 ) -> TPCounts:
     """Compute partial-credit ``MPP`` counts for a one-to-one matching.
 
-    Matched predictions receive precision-side credit according to the fraction
-    of their span that overlaps the reference. Matched references receive
-    recall-side credit according to the fraction of their span that overlaps the
-    prediction.
+    Matched predictions and references receive overlap-fraction credit scaled by
+    the severity reward for the selected pair.
     """
 
     matched_by_prediction = {pred_idx: ref_idx for pred_idx, ref_idx in matches}
@@ -317,7 +356,10 @@ def _compute_o2o_mpp_tp_counts(
         if ref_idx is None:
             fp += 1.0
             continue
-        credit = overlap_length(pred, references[ref_idx]) / pred.length
+        ref = references[ref_idx]
+        credit = (overlap_length(pred, ref) / pred.length) * severity_reward(
+            pred, ref, severity_penalty
+        )
         tp_for_precision += credit
         fp += 1.0 - credit
 
@@ -328,7 +370,10 @@ def _compute_o2o_mpp_tp_counts(
         if pred_idx is None:
             fn += 1.0
             continue
-        credit = overlap_length(predictions[pred_idx], ref) / ref.length
+        pred = predictions[pred_idx]
+        credit = (overlap_length(pred, ref) / ref.length) * severity_reward(
+            pred, ref, severity_penalty
+        )
         tp_for_recall += credit
         fn += 1.0 - credit
 
@@ -344,6 +389,7 @@ def _compute_m2m_tp_counts(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
     measure: Measure,
+    severity_penalty: float,
 ) -> TPCounts:
     """Compute one segment's many-to-many counts for the selected measure.
 
@@ -353,93 +399,141 @@ def _compute_m2m_tp_counts(
     """
 
     if measure == "EM":
-        return _compute_m2m_em_tp_counts(predictions, references)
+        return _compute_m2m_em_tp_counts(predictions, references, severity_penalty)
     if measure == "MP":
-        return _compute_m2m_mp_tp_counts(predictions, references)
+        return _compute_m2m_mp_tp_counts(predictions, references, severity_penalty)
     if measure == "WMT23":
-        return _compute_m2m_wmt23_tp_counts(predictions, references)
+        return _compute_m2m_wmt23_tp_counts(
+            predictions, references, severity_penalty
+        )
     if measure == "MPP":
-        return _compute_m2m_mpp_tp_counts(predictions, references)
+        return _compute_m2m_mpp_tp_counts(predictions, references, severity_penalty)
     raise ValueError(f"Unknown measure: {measure}")
 
 
 def _compute_m2m_em_tp_counts(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
+    severity_penalty: float,
 ) -> TPCounts:
     """Compute many-to-many exact-match counts as multiset overlap.
 
-    Inputs are normalized spans for one segment. The output compares the
-    multisets of ``(side, start, end)`` triples, preserving duplicate identical
-    spans through their counts.
+    Exact offset matches are resolved by severity first. Remaining exact-offset
+    pairs with different severities receive discounted credit.
     """
 
-    pred_counter = Counter(_span_key(span) for span in predictions)
-    ref_counter = Counter(_span_key(span) for span in references)
+    pred_groups = _exact_span_severity_counters(predictions)
+    ref_groups = _exact_span_severity_counters(references)
 
-    true_positives = float(
-        sum(min(count, ref_counter[key]) for key, count in pred_counter.items())
-    )
+    true_positive_credit = 0.0
+    for key in set(pred_groups).union(ref_groups):
+        pred_counter = pred_groups.get(key, Counter())
+        ref_counter = ref_groups.get(key, Counter())
+        severities = set(pred_counter).union(ref_counter)
+        exact_credit = sum(
+            min(pred_counter[severity], ref_counter[severity])
+            for severity in severities
+        )
+        pred_remaining = sum(pred_counter.values()) - exact_credit
+        ref_remaining = sum(ref_counter.values()) - exact_credit
+        mismatch_credit = min(pred_remaining, ref_remaining)
+        true_positive_credit += exact_credit + (
+            1.0 - severity_penalty
+        ) * mismatch_credit
+
     return TPCounts(
-        tp_for_precision=true_positives,
-        tp_for_recall=true_positives,
-        fp=float(len(predictions)) - true_positives,
-        fn=float(len(references)) - true_positives,
+        tp_for_precision=true_positive_credit,
+        tp_for_recall=true_positive_credit,
+        fp=float(len(predictions)) - true_positive_credit,
+        fn=float(len(references)) - true_positive_credit,
     )
 
 
 def _compute_m2m_mp_tp_counts(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
+    severity_penalty: float,
 ) -> TPCounts:
     """Compute many-to-many binary partial-overlap counts.
 
-    A predicted span receives one precision-side true positive if it overlaps at
-    least one reference span. A reference span receives one recall-side true
-    positive if it overlaps at least one prediction span.
+    A span receives full binary credit when it overlaps any span with the same
+    severity, discounted credit when it only overlaps different severities, and
+    no credit when it has no overlap.
     """
 
-    tp_for_precision = sum(
-        1.0
-        for pred in predictions
-        if any(overlap_length(pred, ref) > 0 for ref in references)
+    counts_by_side, severity_to_idx = _char_count_arrays_by_severity(
+        predictions, references
     )
-    tp_for_recall = sum(
-        1.0
-        for ref in references
-        if any(overlap_length(pred, ref) > 0 for pred in predictions)
-    )
+
+    tp_for_precision = 0.0
+    fp = 0.0
+    for pred in predictions:
+        _, ref_counts = counts_by_side[pred.side]
+        reward = _m2m_binary_overlap_reward(
+            pred, ref_counts, severity_to_idx, severity_penalty
+        )
+        if reward is None:
+            fp += 1.0
+        else:
+            tp_for_precision += reward
+            fp += 1.0 - reward
+
+    tp_for_recall = 0.0
+    fn = 0.0
+    for ref in references:
+        pred_counts, _ = counts_by_side[ref.side]
+        reward = _m2m_binary_overlap_reward(
+            ref, pred_counts, severity_to_idx, severity_penalty
+        )
+        if reward is None:
+            fn += 1.0
+        else:
+            tp_for_recall += reward
+            fn += 1.0 - reward
 
     return TPCounts(
         tp_for_precision=tp_for_precision,
         tp_for_recall=tp_for_recall,
-        fp=float(len(predictions)) - tp_for_precision,
-        fn=float(len(references)) - tp_for_recall,
+        fp=fp,
+        fn=fn,
     )
 
 
 def _compute_m2m_wmt23_tp_counts(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
+    severity_penalty: float,
 ) -> TPCounts:
     """Compute many-to-many character-count ``WMT23`` counts.
 
-    The input spans are converted to per-character coverage arrays separately
-    for source and target sides. Per-character overlap contributes true
-    positives; excess prediction/reference coverage contributes false positives
-    and false negatives.
+    Per-character coverage is decomposed into same-severity matches,
+    different-severity matches, and unmatched mass, mirroring the paper repo.
     """
 
     true_positive_chars = 0.0
     false_positive_chars = 0.0
     false_negative_chars = 0.0
 
-    for side in ("source", "target"):
-        pred_counts, ref_counts = _char_count_arrays(predictions, references, side)
-        matched = np.minimum(pred_counts, ref_counts)
-        true_positive_chars += float(matched.sum())
-        false_positive_chars += float(np.maximum(pred_counts - ref_counts, 0).sum())
-        false_negative_chars += float(np.maximum(ref_counts - pred_counts, 0).sum())
+    decompositions, _ = _m2m_decompositions_by_side(predictions, references)
+    for (
+        _pred_counts,
+        _ref_counts,
+        pred_exact,
+        pred_mismatch,
+        pred_unmatched,
+        _ref_exact,
+        ref_mismatch,
+        ref_unmatched,
+    ) in decompositions.values():
+        true_positive_chars += float(
+            (pred_exact + (1.0 - severity_penalty) * pred_mismatch).sum()
+        )
+        false_positive_chars += float(
+            (severity_penalty * pred_mismatch + pred_unmatched).sum()
+        )
+        false_negative_chars += float(
+            (severity_penalty * ref_mismatch + ref_unmatched).sum()
+        )
 
     return TPCounts(
         tp_for_precision=true_positive_chars,
@@ -452,94 +546,266 @@ def _compute_m2m_wmt23_tp_counts(
 def _compute_m2m_mpp_tp_counts(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
+    severity_penalty: float,
 ) -> TPCounts:
     """Compute many-to-many partial-credit ``MPP`` counts.
 
-    The function first computes matched character mass per side, then assigns
-    each span the average matched fraction across its own characters. The output
-    keeps separate true-positive numerators for precision and recall.
+    Each span receives the average per-character true-positive and error credit
+    for its own severity layer.
     """
 
-    matched_by_side: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-    for side in ("source", "target"):
-        pred_counts, ref_counts = _char_count_arrays(predictions, references, side)
-        matched = np.minimum(pred_counts, ref_counts)
-        matched_by_side[side] = (pred_counts, ref_counts, matched)
+    decompositions, severity_to_idx = _m2m_decompositions_by_side(
+        predictions, references
+    )
 
     tp_for_precision = 0.0
+    fp = 0.0
     for pred in predictions:
-        pred_counts, _, matched = matched_by_side[pred.side]
-        tp_for_precision += _span_average_credit(pred, matched, pred_counts)
+        (
+            pred_counts,
+            _ref_counts,
+            pred_exact,
+            pred_mismatch,
+            pred_unmatched,
+            _ref_exact,
+            _ref_mismatch,
+            _ref_unmatched,
+        ) = decompositions[pred.side]
+        tp_credit, fp_credit = _span_weighted_m2m_credits(
+            pred,
+            severity_to_idx,
+            pred_counts,
+            pred_exact,
+            pred_mismatch,
+            pred_unmatched,
+            severity_penalty,
+        )
+        tp_for_precision += tp_credit
+        fp += fp_credit
 
     tp_for_recall = 0.0
+    fn = 0.0
     for ref in references:
-        _, ref_counts, matched = matched_by_side[ref.side]
-        tp_for_recall += _span_average_credit(ref, matched, ref_counts)
+        (
+            _pred_counts,
+            ref_counts,
+            _pred_exact,
+            _pred_mismatch,
+            _pred_unmatched,
+            ref_exact,
+            ref_mismatch,
+            ref_unmatched,
+        ) = decompositions[ref.side]
+        tp_credit, fn_credit = _span_weighted_m2m_credits(
+            ref,
+            severity_to_idx,
+            ref_counts,
+            ref_exact,
+            ref_mismatch,
+            ref_unmatched,
+            severity_penalty,
+        )
+        tp_for_recall += tp_credit
+        fn += fn_credit
 
     return TPCounts(
         tp_for_precision=tp_for_precision,
         tp_for_recall=tp_for_recall,
-        fp=float(len(predictions)) - tp_for_precision,
-        fn=float(len(references)) - tp_for_recall,
+        fp=fp,
+        fn=fn,
     )
 
 
-def _span_average_credit(
+def _exact_span_severity_counters(
+    spans: list[ErrorSpan],
+) -> dict[tuple[str, int, int], Counter[str | None]]:
+    """Group exact span identities by severity label."""
+
+    groups: dict[tuple[str, int, int], Counter[str | None]] = {}
+    for span in spans:
+        groups.setdefault(_span_key(span), Counter())[span.severity] += 1
+    return groups
+
+
+def _m2m_binary_overlap_reward(
     span: ErrorSpan,
-    matched_counts: np.ndarray,
-    denominator_counts: np.ndarray,
-) -> float:
-    """Return a span's average per-character matched credit.
+    other_counts: np.ndarray,
+    severity_to_idx: dict[str | None, int],
+    severity_penalty: float,
+) -> float | None:
+    """Return binary many-to-many reward for one span, or ``None``."""
 
-    ``matched_counts`` contains matched mass at each character position, and
-    ``denominator_counts`` contains the prediction or reference mass used as the
-    denominator. The returned value is a floating-point credit in ``[0, 1]`` for
-    the given span.
-    """
+    other_slice = other_counts[:, span.start : span.end]
+    if not bool(np.any(other_slice.sum(axis=0) > 0)):
+        return None
 
-    if len(denominator_counts) < span.end:
-        raise ValueError(f"The array denominator_counts is too short! It must be at least as long as span.end={span.end}")
-
-    matched_slice = matched_counts[span.start : span.end]
-    denominator_slice = denominator_counts[span.start : span.end]
-    credit_by_char = np.divide(
-        matched_slice,
-        denominator_slice,
-        out=np.zeros_like(matched_slice, dtype=np.float64),
-        where=denominator_slice > 0,
-    )
-    return float(credit_by_char.sum() / span.length)
+    severity_idx = severity_to_idx[span.severity]
+    same_severity_overlap = bool(np.any(other_slice[severity_idx] > 0))
+    return 1.0 if same_severity_overlap else 1.0 - severity_penalty
 
 
-def _char_count_arrays(
+def _m2m_decompositions_by_side(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
-    side: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build per-character prediction and reference coverage arrays.
+) -> tuple[
+    dict[str, tuple[np.ndarray, ...]],
+    dict[str | None, int],
+]:
+    """Return per-side severity decompositions for many-to-many metrics."""
 
-    Inputs are all segment spans plus the side to inspect. The output arrays have
-    one entry per character position and count how many prediction/reference
-    spans cover that position.
-    """
+    counts_by_side, severity_to_idx = _char_count_arrays_by_severity(
+        predictions, references
+    )
+    decompositions: dict[str, tuple[np.ndarray, ...]] = {}
+    for side, (pred_counts, ref_counts) in counts_by_side.items():
+        decompositions[side] = (
+            pred_counts,
+            ref_counts,
+            *_decompose_counts(pred_counts, ref_counts),
+        )
+    return decompositions, severity_to_idx
 
-    side_predictions = [span for span in predictions if span.side == side]
-    side_references = [span for span in references if span.side == side]
-    max_end = max(
-        [0]
-        + [span.end for span in side_predictions]
-        + [span.end for span in side_references]
+
+def _span_weighted_m2m_credits(
+    span: ErrorSpan,
+    severity_to_idx: dict[str | None, int],
+    counts: np.ndarray,
+    exact: np.ndarray,
+    mismatch: np.ndarray,
+    unmatched: np.ndarray,
+    severity_penalty: float,
+) -> tuple[float, float]:
+    """Return average true-positive and error credit for one span."""
+
+    severity_idx = severity_to_idx[span.severity]
+    denominator = counts[severity_idx, span.start : span.end]
+    true_positive_numerator = (
+        exact[severity_idx, span.start : span.end]
+        + (1.0 - severity_penalty) * mismatch[severity_idx, span.start : span.end]
+    )
+    error_numerator = (
+        severity_penalty * mismatch[severity_idx, span.start : span.end]
+        + unmatched[severity_idx, span.start : span.end]
     )
 
-    pred_counts = np.zeros(max_end, dtype=np.float64)
-    ref_counts = np.zeros(max_end, dtype=np.float64)
+    true_positive_by_char = np.divide(
+        true_positive_numerator,
+        denominator,
+        out=np.zeros_like(true_positive_numerator, dtype=np.float64),
+        where=denominator > 0,
+    )
+    error_by_char = np.divide(
+        error_numerator,
+        denominator,
+        out=np.zeros_like(error_numerator, dtype=np.float64),
+        where=denominator > 0,
+    )
+    return (
+        float(true_positive_by_char.sum() / span.length),
+        float(error_by_char.sum() / span.length),
+    )
 
-    for span in side_predictions:
-        pred_counts[span.start : span.end] += 1.0
-    for span in side_references:
-        ref_counts[span.start : span.end] += 1.0
 
-    return pred_counts, ref_counts
+def _char_count_arrays_by_severity(
+    predictions: list[ErrorSpan],
+    references: list[ErrorSpan],
+) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], dict[str | None, int]]:
+    """Build per-side, per-severity character coverage arrays."""
+
+    labels = _collect_severity_labels(predictions, references)
+    severity_to_idx = {label: idx for idx, label in enumerate(labels)}
+    counts_by_side: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    for side in ("source", "target"):
+        side_predictions = [span for span in predictions if span.side == side]
+        side_references = [span for span in references if span.side == side]
+        max_end = max(
+            [0]
+            + [span.end for span in side_predictions]
+            + [span.end for span in side_references]
+        )
+        pred_counts = np.zeros((len(labels), max_end), dtype=np.float64)
+        ref_counts = np.zeros((len(labels), max_end), dtype=np.float64)
+
+        for span in side_predictions:
+            pred_counts[severity_to_idx[span.severity], span.start : span.end] += 1.0
+        for span in side_references:
+            ref_counts[severity_to_idx[span.severity], span.start : span.end] += 1.0
+
+        counts_by_side[side] = (pred_counts, ref_counts)
+
+    return counts_by_side, severity_to_idx
+
+
+def _collect_severity_labels(
+    predictions: list[ErrorSpan],
+    references: list[ErrorSpan],
+) -> list[str | None]:
+    """Return stable severity labels present in one segment."""
+
+    labels: list[str | None] = []
+    seen: set[str | None] = set()
+    for span in [*predictions, *references]:
+        if span.severity in seen:
+            continue
+        seen.add(span.severity)
+        labels.append(span.severity)
+    return labels or [None]
+
+
+def _decompose_counts(
+    pred_counts: np.ndarray,
+    ref_counts: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Split coverage into exact, severity-mismatch, and unmatched mass."""
+
+    num_severities, length = pred_counts.shape
+    pred_exact = np.zeros((num_severities, length), dtype=np.float64)
+    pred_mismatch = np.zeros((num_severities, length), dtype=np.float64)
+    pred_unmatched = np.zeros((num_severities, length), dtype=np.float64)
+    ref_exact = np.zeros((num_severities, length), dtype=np.float64)
+    ref_mismatch = np.zeros((num_severities, length), dtype=np.float64)
+    ref_unmatched = np.zeros((num_severities, length), dtype=np.float64)
+
+    for idx in range(length):
+        pred = pred_counts[:, idx].astype(np.float64)
+        ref = ref_counts[:, idx].astype(np.float64)
+        if not (pred.any() or ref.any()):
+            continue
+
+        exact = np.minimum(pred, ref)
+        pred_exact[:, idx] = exact
+        ref_exact[:, idx] = exact
+
+        pred_remaining = pred - exact
+        ref_remaining = ref - exact
+        pred_remaining_total = float(pred_remaining.sum())
+        ref_remaining_total = float(ref_remaining.sum())
+        mismatch_pairs = min(pred_remaining_total, ref_remaining_total)
+
+        if mismatch_pairs > 0.0:
+            pred_mismatch[:, idx] = pred_remaining * (
+                mismatch_pairs / pred_remaining_total
+            )
+            ref_mismatch[:, idx] = ref_remaining * (
+                mismatch_pairs / ref_remaining_total
+            )
+
+        pred_unmatched[:, idx] = np.maximum(
+            0.0, pred_remaining - pred_mismatch[:, idx]
+        )
+        ref_unmatched[:, idx] = np.maximum(
+            0.0, ref_remaining - ref_mismatch[:, idx]
+        )
+
+    return (
+        pred_exact,
+        pred_mismatch,
+        pred_unmatched,
+        ref_exact,
+        ref_mismatch,
+        ref_unmatched,
+    )
 
 
 def _precision_recall_fscore(counts: TPCounts) -> tuple[float, float, float]:
@@ -731,3 +997,30 @@ def _validate_averaging(value: Any):
 
     if value not in AVERAGING_STRATEGIES:
         raise ValueError(f"averaging must be one of {AVERAGING_STRATEGIES}")
+
+
+def _validate_severity_penalty(value: Any) -> float:
+    """Validate and normalize the caller-provided severity penalty."""
+
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError("severity_penalty must be a number between 0.0 and 1.0")
+
+    penalty = float(value)
+    if not np.isfinite(penalty) or penalty < 0.0 or penalty > 1.0:
+        raise ValueError("severity_penalty must be between 0.0 and 1.0")
+    return penalty
+
+
+def _validate_required_severities(
+    segments: list[list[ErrorSpan]],
+    name: str,
+) -> None:
+    """Require every span to carry severity for non-zero penalties."""
+
+    for segment_idx, spans in enumerate(segments):
+        for span_idx, span in enumerate(spans):
+            if span.severity is None:
+                raise ValueError(
+                    "severity_penalty > 0 requires every span to include a "
+                    f"non-empty severity; missing {name}[{segment_idx}][{span_idx}]"
+                )

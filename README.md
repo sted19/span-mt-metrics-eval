@@ -49,10 +49,10 @@ python -m pip install ".[speed]"
 from span_mt_metrics_eval import compute
 
 predictions = [
-    {"start": 8, "end": 13, "side": "target"},
+    {"start": 8, "end": 13, "side": "target", "severity": "major"},
 ]
 references = [
-    {"start": 8, "end": 13, "side": "target"},
+    {"start": 8, "end": 13, "side": "target", "severity": "major"},
 ]
 
 result = compute(
@@ -108,8 +108,10 @@ Dictionary spans may use either `side` or the WMT-style `is_source_error` flag:
 {"start": 0, "end": 5, "is_source_error": True}
 ```
 
-Extra dictionary fields, such as `category` or `severity`, are accepted and
-ignored by the metric calculation.
+Extra dictionary fields, such as `category`, are accepted and ignored by the
+metric calculation. `severity` is optional by default, but it is used when
+`severity_penalty` is greater than zero. Severity labels are stripped and
+lowercased before comparison.
 
 ## Computing All Metrics
 
@@ -147,6 +149,13 @@ for name, metric_result in results.items():
 
 - `micro`
 - `macro`
+
+`severity_penalty`:
+
+- float in `[0.0, 1.0]`
+- `0.0` keeps severity labels from affecting scores
+- values greater than `0.0` require every span to include a non-empty `severity`
+- mismatched severities receive `1 - severity_penalty` credit
 
 Optional `source_texts` and `target_texts` can be supplied to validate that span
 offsets fit within the corresponding segment text:
