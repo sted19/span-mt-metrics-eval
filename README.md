@@ -157,6 +157,16 @@ for name, metric_result in results.items():
 - values greater than `0.0` require every span to include a non-empty `severity`
 - mismatched severities receive `1 - severity_penalty` credit
 
+`severity_weights`:
+
+- dictionary of severity labels to finite non-negative weights, for example
+  `{"minor": 0.2, "major": 1.0}`
+- supported for `measure="MPP"` with both `one_to_one` and `many_to_many` matching
+- values are normalized by severity label, and every evaluated span must have a
+  non-empty severity with a configured weight
+- cannot be combined with a non-zero `severity_penalty`
+- when `measure="all"`, only the returned `MPP` result uses severity weights
+
 Optional `source_texts` and `target_texts` can be supplied to validate that span
 offsets fit within the corresponding segment text:
 

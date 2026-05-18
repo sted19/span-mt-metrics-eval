@@ -157,8 +157,9 @@ class MetricConfig:
     matching_algorithm: MatchingAlgorithm | None
     averaging: AveragingStrategy
     severity_penalty: float = 0.0
+    severity_weights: dict[str, float] | None = None
 
-    def as_dict(self) -> dict[str, str | float | None]:
+    def as_dict(self) -> dict[str, str | float | dict[str, float] | None]:
         """Return a JSON-serializable representation of the metric options."""
 
         return {
@@ -167,6 +168,7 @@ class MetricConfig:
             "matching_algorithm": self.matching_algorithm,
             "averaging": self.averaging,
             "severity_penalty": self.severity_penalty,
+            "severity_weights": self.severity_weights,
         }
 
 

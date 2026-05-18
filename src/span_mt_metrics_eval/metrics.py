@@ -11,7 +11,7 @@ counting helpers. The implementation is organized in three layers:
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from numbers import Real
 from typing import Any
 import logging
@@ -39,6 +39,7 @@ from span_mt_metrics_eval.types import (
     Measure,
     MetricConfig,
     MetricResult,
+    _normalize_severity,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ def compute(
     matching_algorithm: MatchingAlgorithm = "optimal",
     averaging: AveragingStrategy = "micro",
     severity_penalty: float = 0.0,
+    severity_weights: Mapping[str, Real] | None = None,
     source_texts: str | list[str] | None = None,
     target_texts: str | list[str] | None = None,
 ) -> MetricResult | dict[Measure, MetricResult]:
@@ -64,7 +66,8 @@ def compute(
     The metric is selected with ``measure``. Passing ``measure="all"`` returns a
     dictionary with one ``MetricResult`` per metric; otherwise this function
     returns a single ``MetricResult``. ``severity_penalty`` discounts matches
-    whose normalized severity labels differ. Optional text inputs are currently
+    whose normalized severity labels differ. ``severity_weights`` assigns
+    severity-specific importance mass for MPP. Optional text inputs are currently
     kept in the signature for users who want to pass source/target context
     alongside offsets.
     """
@@ -74,6 +77,8 @@ def compute(
     _validate_matching_algorithm(matching_algorithm)
     _validate_averaging(averaging)
     severity_penalty = _validate_severity_penalty(severity_penalty)
+    severity_weights = _validate_severity_weights(severity_weights)
+    _validate_severity_weight_compatibility(measure, severity_penalty, severity_weights)
 
     if measure == "all":
         result = {
@@ -85,6 +90,7 @@ def compute(
                 matching_algorithm=matching_algorithm,
                 averaging=averaging,
                 severity_penalty=severity_penalty,
+                severity_weights=severity_weights if item == "MPP" else None,
                 source_texts=source_texts,
                 target_texts=target_texts,
             )
@@ -106,6 +112,13 @@ def compute(
     if severity_penalty > 0.0:
         _validate_required_severities(predictions, "predictions")
         _validate_required_severities(references, "references")
+    if severity_weights is not None:
+        _validate_required_severity_weights(
+            predictions, "predictions", severity_weights
+        )
+        _validate_required_severity_weights(
+            references, "references", severity_weights
+        )
 
     source_text_list = (
         _coerce_texts(source_texts, len(predictions), "source_texts")
@@ -133,6 +146,7 @@ def compute(
             matching=matching,
             matching_algorithm=matching_algorithm,
             severity_penalty=severity_penalty,
+            severity_weights=severity_weights,
         )
         for segment_predictions, segment_references in zip(predictions, references)
     ]
@@ -146,6 +160,7 @@ def compute(
         ),
         averaging=averaging,
         severity_penalty=severity_penalty,
+        severity_weights=severity_weights,
     )
 
     if averaging == "micro":
@@ -176,6 +191,7 @@ def _compute_tp_counts(
     matching: MatchingStrategy,
     matching_algorithm: MatchingAlgorithm,
     severity_penalty: float,
+    severity_weights: dict[str, float] | None,
 ) -> TPCounts:
     """Compute one segment's raw counts for the requested matching strategy.
 
@@ -186,9 +202,16 @@ def _compute_tp_counts(
 
     if matching == "one_to_one":
         return _compute_o2o_tp_counts(
-            predictions, references, measure, matching_algorithm, severity_penalty
+            predictions,
+            references,
+            measure,
+            matching_algorithm,
+            severity_penalty,
+            severity_weights,
         )
-    return _compute_m2m_tp_counts(predictions, references, measure, severity_penalty)
+    return _compute_m2m_tp_counts(
+        predictions, references, measure, severity_penalty, severity_weights
+    )
 
 
 def _compute_o2o_tp_counts(
@@ -197,6 +220,7 @@ def _compute_o2o_tp_counts(
     measure: Measure,
     matching_algorithm: MatchingAlgorithm,
     severity_penalty: float,
+    severity_weights: dict[str, float] | None,
 ) -> TPCounts:
     """Compute one-to-one counts after choosing matched span pairs.
 
@@ -206,10 +230,12 @@ def _compute_o2o_tp_counts(
     """
 
     if matching_algorithm == "greedy":
-        matches = find_greedy_matches(predictions, references, severity_penalty)
+        matches = find_greedy_matches(
+            predictions, references, severity_penalty, severity_weights
+        )
     else:
         matches = find_optimal_matches(
-            predictions, references, measure, severity_penalty
+            predictions, references, measure, severity_penalty, severity_weights
         )
 
     if measure == "EM":
@@ -226,7 +252,7 @@ def _compute_o2o_tp_counts(
         )
     if measure == "MPP":
         return _compute_o2o_mpp_tp_counts(
-            predictions, references, matches, severity_penalty
+            predictions, references, matches, severity_penalty, severity_weights
         )
     raise ValueError(f"Unknown measure: {measure}")
 
@@ -339,12 +365,18 @@ def _compute_o2o_mpp_tp_counts(
     references: list[ErrorSpan],
     matches: MatchPairs,
     severity_penalty: float,
+    severity_weights: dict[str, float] | None,
 ) -> TPCounts:
     """Compute partial-credit ``MPP`` counts for a one-to-one matching.
 
     Matched predictions and references receive overlap-fraction credit scaled by
-    the severity reward for the selected pair.
+    either the severity penalty reward or the minimum matched severity weight.
     """
+
+    if severity_weights is not None:
+        return _compute_weighted_o2o_mpp_tp_counts(
+            predictions, references, matches, severity_weights
+        )
 
     matched_by_prediction = {pred_idx: ref_idx for pred_idx, ref_idx in matches}
     matched_by_reference = {ref_idx: pred_idx for pred_idx, ref_idx in matches}
@@ -385,11 +417,63 @@ def _compute_o2o_mpp_tp_counts(
     )
 
 
+def _compute_weighted_o2o_mpp_tp_counts(
+    predictions: list[ErrorSpan],
+    references: list[ErrorSpan],
+    matches: MatchPairs,
+    severity_weights: dict[str, float],
+) -> TPCounts:
+    """Compute severity-weighted one-to-one MPP counts.
+
+    Precision and recall denominators are the total severity mass on their own
+    side. A matched pair can receive at most the lower of the two severity
+    weights, so severity mismatches are discounted by construction.
+    """
+
+    matched_by_prediction = {pred_idx: ref_idx for pred_idx, ref_idx in matches}
+    matched_by_reference = {ref_idx: pred_idx for pred_idx, ref_idx in matches}
+
+    prediction_weight_total = _span_severity_mass_total(predictions, severity_weights)
+    reference_weight_total = _span_severity_mass_total(references, severity_weights)
+
+    tp_for_precision = 0.0
+    for pred_idx, pred in enumerate(predictions):
+        ref_idx = matched_by_prediction.get(pred_idx)
+        if ref_idx is None:
+            continue
+        ref = references[ref_idx]
+        matched_weight = min(
+            _span_severity_weight(pred, severity_weights),
+            _span_severity_weight(ref, severity_weights),
+        )
+        tp_for_precision += (overlap_length(pred, ref) / pred.length) * matched_weight
+
+    tp_for_recall = 0.0
+    for ref_idx, ref in enumerate(references):
+        pred_idx = matched_by_reference.get(ref_idx)
+        if pred_idx is None:
+            continue
+        pred = predictions[pred_idx]
+        matched_weight = min(
+            _span_severity_weight(pred, severity_weights),
+            _span_severity_weight(ref, severity_weights),
+        )
+        tp_for_recall += (overlap_length(pred, ref) / ref.length) * matched_weight
+
+    return TPCounts(
+        tp_for_precision=tp_for_precision,
+        tp_for_recall=tp_for_recall,
+        fp=prediction_weight_total - tp_for_precision,
+        fn=reference_weight_total - tp_for_recall,
+    )
+
+
 def _compute_m2m_tp_counts(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
     measure: Measure,
     severity_penalty: float,
+    severity_weights: dict[str, float] | None,
 ) -> TPCounts:
     """Compute one segment's many-to-many counts for the selected measure.
 
@@ -407,7 +491,9 @@ def _compute_m2m_tp_counts(
             predictions, references, severity_penalty
         )
     if measure == "MPP":
-        return _compute_m2m_mpp_tp_counts(predictions, references, severity_penalty)
+        return _compute_m2m_mpp_tp_counts(
+            predictions, references, severity_penalty, severity_weights
+        )
     raise ValueError(f"Unknown measure: {measure}")
 
 
@@ -547,12 +633,18 @@ def _compute_m2m_mpp_tp_counts(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
     severity_penalty: float,
+    severity_weights: dict[str, float] | None,
 ) -> TPCounts:
     """Compute many-to-many partial-credit ``MPP`` counts.
 
     Each span receives the average per-character true-positive and error credit
     for its own severity layer.
     """
+
+    if severity_weights is not None:
+        return _compute_weighted_m2m_mpp_tp_counts(
+            predictions, references, severity_weights
+        )
 
     decompositions, severity_to_idx = _m2m_decompositions_by_side(
         predictions, references
@@ -616,6 +708,80 @@ def _compute_m2m_mpp_tp_counts(
     )
 
 
+
+def _compute_weighted_m2m_mpp_tp_counts(
+    predictions: list[ErrorSpan],
+    references: list[ErrorSpan],
+    severity_weights: dict[str, float],
+) -> TPCounts:
+    """Compute severity-weighted many-to-many MPP counts.
+
+    Weighted coverage is decomposed per character and severity. Same-severity
+    mass matches first, and remaining cross-severity mass matches up to the
+    smaller side, which mirrors the one-to-one ``min(weight1, weight2)`` rule.
+    """
+
+    decompositions, severity_to_idx = _m2m_decompositions_by_side(
+        predictions, references, severity_weights
+    )
+
+    tp_for_precision = 0.0
+    fp = 0.0
+    for pred in predictions:
+        (
+            pred_counts,
+            _ref_counts,
+            pred_exact,
+            pred_mismatch,
+            pred_unmatched,
+            _ref_exact,
+            _ref_mismatch,
+            _ref_unmatched,
+        ) = decompositions[pred.side]
+        tp_credit, fp_credit = _span_severity_weighted_m2m_credits(
+            pred,
+            severity_to_idx,
+            pred_counts,
+            pred_exact,
+            pred_mismatch,
+            pred_unmatched,
+            severity_weights,
+        )
+        tp_for_precision += tp_credit
+        fp += fp_credit
+
+    tp_for_recall = 0.0
+    fn = 0.0
+    for ref in references:
+        (
+            _pred_counts,
+            ref_counts,
+            _pred_exact,
+            _pred_mismatch,
+            _pred_unmatched,
+            ref_exact,
+            ref_mismatch,
+            ref_unmatched,
+        ) = decompositions[ref.side]
+        tp_credit, fn_credit = _span_severity_weighted_m2m_credits(
+            ref,
+            severity_to_idx,
+            ref_counts,
+            ref_exact,
+            ref_mismatch,
+            ref_unmatched,
+            severity_weights,
+        )
+        tp_for_recall += tp_credit
+        fn += fn_credit
+
+    return TPCounts(
+        tp_for_precision=tp_for_precision,
+        tp_for_recall=tp_for_recall,
+        fp=fp,
+        fn=fn,
+    )
+
 def _exact_span_severity_counters(
     spans: list[ErrorSpan],
 ) -> dict[tuple[str, int, int], Counter[str | None]]:
@@ -647,6 +813,7 @@ def _m2m_binary_overlap_reward(
 def _m2m_decompositions_by_side(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
+    severity_weights: dict[str, float] | None = None,
 ) -> tuple[
     dict[str, tuple[np.ndarray, ...]],
     dict[str | None, int],
@@ -654,7 +821,7 @@ def _m2m_decompositions_by_side(
     """Return per-side severity decompositions for many-to-many metrics."""
 
     counts_by_side, severity_to_idx = _char_count_arrays_by_severity(
-        predictions, references
+        predictions, references, severity_weights
     )
     decompositions: dict[str, tuple[np.ndarray, ...]] = {}
     for side, (pred_counts, ref_counts) in counts_by_side.items():
@@ -706,9 +873,73 @@ def _span_weighted_m2m_credits(
     )
 
 
+
+def _span_severity_weighted_m2m_credits(
+    span: ErrorSpan,
+    severity_to_idx: dict[str | None, int],
+    counts: np.ndarray,
+    exact: np.ndarray,
+    mismatch: np.ndarray,
+    unmatched: np.ndarray,
+    severity_weights: dict[str, float],
+) -> tuple[float, float]:
+    """Return severity-weighted average MPP credit for one span.
+
+    ``counts`` and decomposition arrays contain weighted mass. Dividing by the
+    weighted coverage for the span's severity distributes each character's
+    matched mass proportionally across duplicate covering spans.
+    """
+
+    severity_idx = severity_to_idx[span.severity]
+    span_weight = _span_severity_weight(span, severity_weights)
+    denominator = counts[severity_idx, span.start : span.end]
+    true_positive_numerator = (
+        exact[severity_idx, span.start : span.end]
+        + mismatch[severity_idx, span.start : span.end]
+    )
+    error_numerator = unmatched[severity_idx, span.start : span.end]
+
+    true_positive_by_char = np.divide(
+        true_positive_numerator,
+        denominator,
+        out=np.zeros_like(true_positive_numerator, dtype=np.float64),
+        where=denominator > 0,
+    )
+    error_by_char = np.divide(
+        error_numerator,
+        denominator,
+        out=np.zeros_like(error_numerator, dtype=np.float64),
+        where=denominator > 0,
+    )
+    return (
+        float(span_weight * true_positive_by_char.sum() / span.length),
+        float(span_weight * error_by_char.sum() / span.length),
+    )
+
+
+def _span_severity_weight(
+    span: ErrorSpan,
+    severity_weights: dict[str, float] | None,
+) -> float:
+    """Return one span's configured severity mass, defaulting to one."""
+
+    if severity_weights is None:
+        return 1.0
+    return severity_weights[span.severity or ""]
+
+
+def _span_severity_mass_total(
+    spans: list[ErrorSpan],
+    severity_weights: dict[str, float],
+) -> float:
+    """Return the total configured severity mass for a list of spans."""
+
+    return sum(_span_severity_weight(span, severity_weights) for span in spans)
+
 def _char_count_arrays_by_severity(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
+    severity_weights: dict[str, float] | None = None,
 ) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], dict[str | None, int]]:
     """Build per-side, per-severity character coverage arrays."""
 
@@ -728,9 +959,13 @@ def _char_count_arrays_by_severity(
         ref_counts = np.zeros((len(labels), max_end), dtype=np.float64)
 
         for span in side_predictions:
-            pred_counts[severity_to_idx[span.severity], span.start : span.end] += 1.0
+            pred_counts[severity_to_idx[span.severity], span.start : span.end] += (
+                _span_severity_weight(span, severity_weights)
+            )
         for span in side_references:
-            ref_counts[severity_to_idx[span.severity], span.start : span.end] += 1.0
+            ref_counts[severity_to_idx[span.severity], span.start : span.end] += (
+                _span_severity_weight(span, severity_weights)
+            )
 
         counts_by_side[side] = (pred_counts, ref_counts)
 
@@ -1010,6 +1245,82 @@ def _validate_severity_penalty(value: Any) -> float:
         raise ValueError("severity_penalty must be between 0.0 and 1.0")
     return penalty
 
+
+
+def _validate_severity_weights(
+    value: Mapping[str, Real] | None,
+) -> dict[str, float] | None:
+    """Validate and normalize caller-provided severity weights."""
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise TypeError("severity_weights must be a mapping of severity labels to weights")
+
+    normalized_weights: dict[str, float] = {}
+    for raw_label, raw_weight in value.items():
+        if not isinstance(raw_label, str):
+            raise TypeError(
+                "severity_weights keys must be non-empty severity labels"
+            )
+        label = _normalize_severity(raw_label)
+        if label is None:
+            raise ValueError("severity_weights keys must be non-empty severity labels")
+        if label in normalized_weights:
+            raise ValueError(
+                "severity_weights contains duplicate labels after normalization"
+            )
+        if isinstance(raw_weight, bool) or not isinstance(raw_weight, Real):
+            raise TypeError(
+                "severity_weights values must be finite non-negative numbers"
+            )
+
+        weight = float(raw_weight)
+        if not np.isfinite(weight) or weight < 0.0:
+            raise ValueError(
+                "severity_weights values must be finite non-negative numbers"
+            )
+        normalized_weights[label] = weight
+
+    return normalized_weights
+
+
+def _validate_severity_weight_compatibility(
+    measure: Any,
+    severity_penalty: float,
+    severity_weights: dict[str, float] | None,
+) -> None:
+    """Validate that severity weighting is used only for supported MPP calls."""
+
+    if severity_weights is None:
+        return
+    if severity_penalty > 0.0:
+        raise ValueError(
+            "severity_weights cannot be combined with a non-zero severity_penalty"
+        )
+    if measure not in {"MPP", "all"}:
+        raise ValueError("severity_weights is only supported for measure='MPP'")
+
+
+def _validate_required_severity_weights(
+    segments: list[list[ErrorSpan]],
+    name: str,
+    severity_weights: dict[str, float],
+) -> None:
+    """Require every span to carry a severity with a configured weight."""
+
+    for segment_idx, spans in enumerate(segments):
+        for span_idx, span in enumerate(spans):
+            if span.severity is None:
+                raise ValueError(
+                    "severity_weights requires every span to include a "
+                    f"non-empty severity; missing {name}[{segment_idx}][{span_idx}]"
+                )
+            if span.severity not in severity_weights:
+                raise ValueError(
+                    "severity_weights is missing a weight for severity "
+                    f"{span.severity!r} at {name}[{segment_idx}][{span_idx}]"
+                )
 
 def _validate_required_severities(
     segments: list[list[ErrorSpan]],

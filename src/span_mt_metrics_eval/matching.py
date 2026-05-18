@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
-from typing import Callable
+from collections.abc import Callable, Mapping
 
 import numpy as np
 
@@ -111,6 +111,7 @@ def find_greedy_matches(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
     severity_penalty: float = 0.0,
+    severity_weights: Mapping[str, float] | None = None,
 ) -> MatchPairs:
     """Greedily select non-conflicting pairs by harmonic overlap score.
 
@@ -122,8 +123,8 @@ def find_greedy_matches(
     candidates: list[tuple[float, int, int]] = []
     for pred_idx, pred in enumerate(predictions):
         for ref_idx, ref in enumerate(references):
-            score = harmonic_overlap_score(pred, ref) * severity_reward(
-                pred, ref, severity_penalty
+            score = harmonic_overlap_score(pred, ref) * _mpp_pair_credit_mass(
+                pred, ref, severity_penalty, severity_weights
             )
             if score > 0:
                 candidates.append((score, pred_idx, ref_idx))
@@ -149,6 +150,7 @@ def find_optimal_matches(
     references: list[ErrorSpan],
     measure: Measure,
     severity_penalty: float = 0.0,
+    severity_weights: Mapping[str, float] | None = None,
 ) -> MatchPairs:
     """Find a score-maximizing one-to-one matching for the selected measure.
 
@@ -161,7 +163,9 @@ def find_optimal_matches(
         return []
 
     if measure == "MPP":
-        return _find_optimal_mpp_matches(predictions, references, severity_penalty)
+        return _find_optimal_mpp_matches(
+            predictions, references, severity_penalty, severity_weights
+        )
 
     return _find_linear_sum_matches(
         predictions, references, metric_objective(measure, severity_penalty)
@@ -205,6 +209,7 @@ def _find_optimal_mpp_matches(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
     severity_penalty: float = 0.0,
+    severity_weights: Mapping[str, float] | None = None,
 ) -> MatchPairs:
     """Find the one-to-one MPP matching maximizing final segment F-score.
 
@@ -221,7 +226,9 @@ def _find_optimal_mpp_matches(
             overlap = overlap_length(pred, ref)
             if overlap <= 0:
                 continue
-            reward = severity_reward(pred, ref, severity_penalty)
+            reward = _mpp_pair_credit_mass(
+                pred, ref, severity_penalty, severity_weights
+            )
             pair_score = harmonic_overlap_score(pred, ref) * reward
             if pair_score <= 0:
                 continue
@@ -235,6 +242,9 @@ def _find_optimal_mpp_matches(
 
     if not any(candidates_by_prediction):
         return []
+
+    prediction_denominator = _mpp_denominator(predictions, severity_weights)
+    reference_denominator = _mpp_denominator(references, severity_weights)
 
     prediction_order = sorted(
         range(len(predictions)),
@@ -273,10 +283,10 @@ def _find_optimal_mpp_matches(
         predictions,
         references,
         lambda pred, ref: harmonic_overlap_score(pred, ref)
-        * severity_reward(pred, ref, severity_penalty),
+        * _mpp_pair_credit_mass(pred, ref, severity_penalty, severity_weights),
     )
     best_key = _mpp_matching_key(
-        best_matches, predictions, references, severity_penalty
+        best_matches, predictions, references, severity_penalty, severity_weights
     )
     current_matches: MatchPairs = []
 
@@ -291,8 +301,8 @@ def _find_optimal_mpp_matches(
         upper_f_score = _mpp_f_score_from_credits(
             precision_credit_sum + suffix_precision_credit[pos],
             recall_credit_sum + suffix_recall_credit[pos],
-            len(predictions),
-            len(references),
+            prediction_denominator,
+            reference_denominator,
         )
         if upper_f_score < best_key[0] - _FLOAT_TOLERANCE:
             return
@@ -301,8 +311,8 @@ def _find_optimal_mpp_matches(
             candidate_key = _mpp_matching_key_from_credits(
                 precision_credit_sum,
                 recall_credit_sum,
-                len(predictions),
-                len(references),
+                prediction_denominator,
+                reference_denominator,
                 len(current_matches),
             )
             if _mpp_key_is_better(
@@ -339,6 +349,7 @@ def _mpp_matching_key(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
     severity_penalty: float = 0.0,
+    severity_weights: Mapping[str, float] | None = None,
 ) -> tuple[float, float, float, float, float]:
     """Return the objective key for an MPP matching."""
 
@@ -348,15 +359,15 @@ def _mpp_matching_key(
         pred = predictions[pred_idx]
         ref = references[ref_idx]
         overlap = overlap_length(pred, ref)
-        reward = severity_reward(pred, ref, severity_penalty)
+        reward = _mpp_pair_credit_mass(pred, ref, severity_penalty, severity_weights)
         precision_credit_sum += (overlap / pred.length) * reward
         recall_credit_sum += (overlap / ref.length) * reward
 
     return _mpp_matching_key_from_credits(
         precision_credit_sum,
         recall_credit_sum,
-        len(predictions),
-        len(references),
+        _mpp_denominator(predictions, severity_weights),
+        _mpp_denominator(references, severity_weights),
         len(matches),
     )
 
@@ -364,8 +375,8 @@ def _mpp_matching_key(
 def _mpp_matching_key_from_credits(
     precision_credit_sum: float,
     recall_credit_sum: float,
-    prediction_count: int,
-    reference_count: int,
+    prediction_count: float,
+    reference_count: float,
     match_count: int,
 ) -> tuple[float, float, float, float, float]:
     """Return comparison values for an MPP matching.
@@ -383,8 +394,8 @@ def _mpp_matching_key_from_credits(
 def _mpp_f_score_from_credits(
     precision_credit_sum: float,
     recall_credit_sum: float,
-    prediction_count: int,
-    reference_count: int,
+    prediction_count: float,
+    reference_count: float,
 ) -> float:
     """Compute MPP F-score from aggregate precision/recall credits."""
 
@@ -418,6 +429,33 @@ def _mpp_key_is_better(
             return False
     return sorted(candidate_matches) < sorted(best_matches)
 
+
+
+def _mpp_pair_credit_mass(
+    pred: ErrorSpan,
+    ref: ErrorSpan,
+    severity_penalty: float,
+    severity_weights: Mapping[str, float] | None,
+) -> float:
+    """Return the pair-level MPP credit multiplier or severity mass."""
+
+    if severity_weights is None:
+        return severity_reward(pred, ref, severity_penalty)
+    return min(
+        severity_weights[pred.severity or ""],
+        severity_weights[ref.severity or ""],
+    )
+
+
+def _mpp_denominator(
+    spans: list[ErrorSpan],
+    severity_weights: Mapping[str, float] | None,
+) -> float:
+    """Return the MPP denominator for one side of a segment."""
+
+    if severity_weights is None:
+        return float(len(spans))
+    return sum(severity_weights[span.severity or ""] for span in spans)
 
 def _get_scipy_linear_sum_assignment():
     """Return SciPy's assignment solver when it imports cleanly.
