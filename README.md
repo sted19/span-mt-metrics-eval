@@ -32,7 +32,7 @@ After this directory is pushed to GitHub, it can be installed directly from the
 repository:
 
 ```bash
-python -m pip install "span-mt-metrics-eval @ git+https://github.com/<OWNER>/span-mt-metrics-eval.git"
+python -m pip install "span-mt-metrics-eval @ git+https://github.com/sted19/span-mt-metrics-eval.git"
 ```
 
 The package depends on NumPy. SciPy is optional; when installed, it is used for
