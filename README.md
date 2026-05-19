@@ -28,21 +28,6 @@ python -m pip install -e ".[dev]"
 python -m pytest
 ```
 
-After this directory is pushed to GitHub, it can be installed directly from the
-repository:
-
-```bash
-python -m pip install "span-mt-metrics-eval @ git+https://github.com/sted19/span-mt-metrics-eval.git"
-```
-
-The package depends on NumPy. SciPy is optional; when installed, it is used for
-faster optimal one-to-one assignment. Without SciPy, the package uses its bundled
-pure-Python fallback:
-
-```bash
-python -m pip install ".[speed]"
-```
-
 ## Quick Start
 
 ```python
@@ -65,7 +50,7 @@ result = compute(
 )
 
 print(result.precision, result.recall, result.f_score)
-print(result.counts.as_dict())
+print(result.details.as_dict())
 ```
 
 Span offsets are half-open character offsets: `start` is included and `end` is
@@ -73,7 +58,7 @@ excluded, matching normal Python slicing.
 
 ## Input Format
 
-`compute` accepts either one segment:
+`compute` accepts annotations relative to either one segment:
 
 ```python
 predictions = [{"start": 0, "end": 5, "side": "target"}]
@@ -110,20 +95,8 @@ Dictionary spans may use either `side` or the WMT-style `is_source_error` flag:
 
 Extra dictionary fields, such as `category`, are accepted and ignored by the
 metric calculation. `severity` is optional by default, but it is used when
-`severity_penalty` is greater than zero. Severity labels are stripped and
-lowercased before comparison.
-
-## Computing All Metrics
-
-Pass `measure="all"` to compute every metric with the same matching and averaging
-configuration:
-
-```python
-results = compute(predictions, references, measure="all")
-
-for name, metric_result in results.items():
-    print(name, metric_result.as_dict())
-```
+`severity_penalty` is greater than zero or `severity_weights` are provided.
+Severity labels are stripped and lowercased before comparison.
 
 ## Options
 
@@ -133,7 +106,6 @@ for name, metric_result in results.items():
 - `MP`
 - `WMT23`
 - `MPP`
-- `all`
 
 `matching`:
 
@@ -162,10 +134,9 @@ for name, metric_result in results.items():
 - dictionary of severity labels to finite non-negative weights, for example
   `{"minor": 0.2, "major": 1.0}`
 - supported for `measure="MPP"` with both `one_to_one` and `many_to_many` matching
-- values are normalized by severity label, and every evaluated span must have a
+- if specified, every evaluated span must have a
   non-empty severity with a configured weight
 - cannot be combined with a non-zero `severity_penalty`
-- when `measure="all"`, only the returned `MPP` result uses severity weights
 
 Optional `source_texts` and `target_texts` can be supplied to validate that span
 offsets fit within the corresponding segment text:
@@ -186,20 +157,27 @@ compute(
 - `precision`
 - `recall`
 - `f_score`
-- `counts`
-- `segments_tp_counts`
+- `details`
 - `config`
+
+`details` is either count-style or side-score-style. Count-style results expose
+real `tp`, `fp`, and `fn` counts. Side-score results expose the precision and
+recall numerators and denominators directly; this is used for `MPP` and for
+many-to-many `MP`, where the prediction and reference sides are scored
+separately.
 
 Use `result.as_dict()` when you need a JSON-serializable representation.
 
-## Tests
+## Project Structure
 
-Run the package tests with:
+The public entrypoint lives in `span_mt_metrics_eval.api`, and the top-level
+package re-exports the main user-facing objects for concise imports. Internals
+are split by responsibility:
 
-```bash
-python -m pytest
-```
-
-Some parity tests compare this standalone package against the original paper
-repository. They run automatically when a sibling `span-mt-metaeval` checkout is
-available and are skipped in a standalone clone.
+- `options.py`: supported metric, matching, and averaging options
+- `spans.py`: `ErrorSpan` plus span side/severity normalization
+- `results.py`: result details, score component containers, and config objects
+- `input.py`: flat/nested input normalization and optional text-bound checks
+- `validation.py`: option and severity validation
+- `matching/`: pair scoring, greedy matching, optimal matching, and assignment fallback
+- `scoring/`: one-to-one components, many-to-many coverage components, and aggregation

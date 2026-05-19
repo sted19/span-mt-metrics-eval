@@ -30,14 +30,12 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.23",
+    "scipy>=1.14",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7",
-]
-speed = [
-    "scipy>=1.14",
 ]
 
 [tool.setuptools]
