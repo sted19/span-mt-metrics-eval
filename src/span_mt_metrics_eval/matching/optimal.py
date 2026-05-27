@@ -8,7 +8,9 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from span_mt_metrics_eval.matching.mpp import (
+    FLOAT_TOLERANCE,
     mpp_denominator,
+    mpp_f_score_from_credits,
     mpp_key_is_better,
     mpp_matching_key_from_credits,
     mpp_pair_credit_mass,
@@ -130,6 +132,9 @@ def find_optimal_mpp_matches(
     # precision/recall normalization the result will use.
     prediction_denominator = mpp_denominator(predictions, severity_weights)
     reference_denominator = mpp_denominator(references, severity_weights)
+    suffix_precision_bounds, suffix_recall_bounds = mpp_suffix_credit_bounds(
+        candidates_by_prediction
+    )
 
     best_matches: MatchPairs = []
     best_key = mpp_matching_key_from_credits(
@@ -150,6 +155,20 @@ def find_optimal_mpp_matches(
         """Enumerate one-to-one continuations from the current prediction."""
 
         nonlocal best_key, best_matches
+
+        # MPP precision and recall denominators are fixed for the segment, and
+        # every retained candidate contributes non-negative precision and recall
+        # credit. The suffix bound therefore gives a safe overestimate of the
+        # best F-score reachable from this partial matching. If even that cannot
+        # beat the incumbent, every continuation below this node can be skipped.
+        upper_bound_f_score = mpp_f_score_from_credits(
+            precision_credit_sum + suffix_precision_bounds[pred_idx],
+            recall_credit_sum + suffix_recall_bounds[pred_idx],
+            prediction_denominator,
+            reference_denominator,
+        )
+        if upper_bound_f_score < best_key[0] - FLOAT_TOLERANCE:
+            return
 
         # Once every prediction has been considered, compare the completed
         # matching against the incumbent using the final MPP objective plus
@@ -189,10 +208,45 @@ def find_optimal_mpp_matches(
 
         # Also explore the possibility that this prediction remains unmatched.
         # This is necessary when matching it would consume a reference that is
-        # more valuable to a later prediction or when all available candidates
-        # reduce the best aggregate precision/recall balance.
+        # more valuable to a later prediction. In no-conflict cases, the bound
+        # above prunes this branch after the all-positive matching is found.
         search(pred_idx + 1, used_references, precision_credit_sum, recall_credit_sum)
 
     search(0, 0, 0.0, 0.0)
     best_matches.sort()
     return best_matches
+
+
+def mpp_suffix_credit_bounds(
+    candidates_by_prediction: list[list[tuple[int, float, float]]],
+) -> tuple[list[float], list[float]]:
+    """Return suffix upper bounds for MPP precision and recall credits.
+
+    The input is the candidate graph built by ``find_optimal_mpp_matches``. The
+    returned lists have one extra trailing zero entry so recursive search can
+    ask for the maximum future precision and recall credit starting at any
+    prediction index, including the leaf index.
+    """
+
+    suffix_precision_bounds = [0.0] * (len(candidates_by_prediction) + 1)
+    suffix_recall_bounds = [0.0] * (len(candidates_by_prediction) + 1)
+
+    for pred_idx in range(len(candidates_by_prediction) - 1, -1, -1):
+        candidates = candidates_by_prediction[pred_idx]
+        max_precision_credit = max(
+            (precision_credit for _, precision_credit, _ in candidates),
+            default=0.0,
+        )
+        max_recall_credit = max(
+            (recall_credit for _, _, recall_credit in candidates),
+            default=0.0,
+        )
+        suffix_precision_bounds[pred_idx] = (
+            suffix_precision_bounds[pred_idx + 1] + max_precision_credit
+        )
+        suffix_recall_bounds[pred_idx] = (
+            suffix_recall_bounds[pred_idx + 1] + max_recall_credit
+        )
+
+    return suffix_precision_bounds, suffix_recall_bounds
+
