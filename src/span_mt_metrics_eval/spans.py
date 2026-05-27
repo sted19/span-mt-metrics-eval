@@ -50,19 +50,15 @@ class ErrorSpan:
 
         return self.end - self.start
 
-    @property
-    def is_source_error(self) -> bool:
-        """Return whether this span belongs to the source text."""
-
-        return self.side == "source"
-
     @classmethod
     def from_any(cls, value: Any) -> "ErrorSpan":
         """Create an ``ErrorSpan`` from an ``ErrorSpan`` or span dictionary.
 
-        Accepted dictionaries contain ``start`` and ``end`` plus either ``side``
-        or WMT-style ``is_source_error``. Extra dictionary fields are ignored.
-        The returned span is fully validated and normalized.
+        Accepted dictionaries contain ``start`` and ``end`` with an optional
+        ``side`` field. Extra dictionary fields are ignored, except for the
+        removed ``is_source_error`` alias, which raises a clear error so callers
+        migrate to ``side`` instead. The returned span is fully validated and
+        normalized.
         """
 
         if isinstance(value, ErrorSpan):
@@ -75,10 +71,10 @@ class ErrorSpan:
             except KeyError as exc:
                 raise ValueError("Span dictionaries must contain 'start' and 'end'") from exc
 
+            if "is_source_error" in value:
+                raise ValueError("Span dictionaries must use 'side', not 'is_source_error'")
             if "side" in value:
                 side = value["side"]
-            elif "is_source_error" in value:
-                side = "source" if value["is_source_error"] else "target"
             else:
                 side = "target"
                 logger.warning("Span dictionary is missing 'side'; defaulting to 'target'")
@@ -115,12 +111,9 @@ def _validate_offset(value: Any, field_name: str) -> None:
 def normalize_side(value: Any) -> Literal["source", "target"]:
     """Normalize side aliases to ``source`` or ``target``.
 
-    The input may be a boolean ``is_source_error`` value or a short string such
-    as ``src``/``tgt``. The normalized side string is returned.
+    The input may be a full side name or a short string such as ``src``/``tgt``.
+    The normalized side string is returned.
     """
-
-    if isinstance(value, bool):
-        return "source" if value else "target"
 
     normalized = str(value).strip().lower()
     if normalized in {"source", "src"}:

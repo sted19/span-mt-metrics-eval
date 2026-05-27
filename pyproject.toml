@@ -9,6 +9,7 @@ description = "Standalone span-level precision, recall, and F-score metrics for 
 readme = "README.md"
 requires-python = ">=3.10"
 keywords = [
+    "arxiv",
     "machine-translation",
     "meta-evaluation",
     "metrics",

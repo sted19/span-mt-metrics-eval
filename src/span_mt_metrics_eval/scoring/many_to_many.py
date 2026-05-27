@@ -35,8 +35,8 @@ def compute_m2m_score_components(
         return compute_m2m_em_counts(predictions, references, severity_penalty)
     if measure == "MP":
         return compute_m2m_mp_components(predictions, references, severity_penalty)
-    if measure == "WMT23":
-        return compute_m2m_wmt23_counts(predictions, references, severity_penalty)
+    if measure == "WMT25":
+        return compute_m2m_wmt25_counts(predictions, references, severity_penalty)
     if measure == "MPP":
         return compute_m2m_mpp_components(
             predictions, references, severity_penalty, severity_weights
@@ -123,12 +123,12 @@ def compute_m2m_mp_components(
     )
 
 
-def compute_m2m_wmt23_counts(
+def compute_m2m_wmt25_counts(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
     severity_penalty: float,
 ) -> TPCounts:
-    """Compute many-to-many character-count ``WMT23`` counts.
+    """Compute many-to-many character-count ``WMT25`` counts.
 
     Per-character coverage is decomposed into same-severity matches,
     different-severity matches, and unmatched mass, mirroring the paper repo.

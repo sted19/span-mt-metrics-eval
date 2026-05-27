@@ -47,8 +47,8 @@ def compute_o2o_score_components(
         return compute_o2o_em_counts(predictions, references, matches, severity_penalty)
     if measure == "MP":
         return compute_o2o_mp_counts(predictions, references, matches, severity_penalty)
-    if measure == "WMT23":
-        return compute_o2o_wmt23_counts(
+    if measure == "WMT25":
+        return compute_o2o_wmt25_counts(
             predictions, references, matches, severity_penalty
         )
     if measure == "MPP":
@@ -108,13 +108,13 @@ def compute_o2o_mp_counts(
     )
 
 
-def compute_o2o_wmt23_counts(
+def compute_o2o_wmt25_counts(
     predictions: list[ErrorSpan],
     references: list[ErrorSpan],
     matches: MatchPairs,
     severity_penalty: float,
 ) -> TPCounts:
-    """Compute character-count ``WMT23`` counts for a one-to-one matching.
+    """Compute character-count ``WMT25`` counts for a one-to-one matching.
 
     Overlapping characters in matched pairs are true positives after applying
     the severity reward. Unrewarded prediction/reference characters become

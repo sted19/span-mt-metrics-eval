@@ -58,7 +58,7 @@ def find_linear_sum_matches(
 ) -> MatchPairs:
     """Find the assignment maximizing a separable pairwise objective.
 
-    This is exact for ``EM``, ``MP``, and ``WMT23`` because their segment-level
+    This is exact for ``EM``, ``MP``, and ``WMT25`` because their segment-level
     F-scores are monotonic in a single summed pairwise score. ``MPP`` is handled
     separately because its paper definition maximizes the final harmonic mean of
     aggregate span-averaged precision and recall.
@@ -92,7 +92,7 @@ def find_optimal_mpp_matches(
     reference_index)`` pairs, with each prediction and reference used at most
     once.
 
-    MPP is different from ``EM``, ``MP``, and ``WMT23`` because selected pairs
+    MPP is different from ``EM``, ``MP``, and ``WMT25`` because selected pairs
     contribute two different credits:
 
     - ``overlap / len(prediction)`` to the precision numerator

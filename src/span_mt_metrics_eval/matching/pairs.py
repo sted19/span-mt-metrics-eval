@@ -84,7 +84,7 @@ def metric_objective(
             (1.0 if overlap_length(pred, ref) > 0 else 0.0)
             * severity_reward(pred, ref, severity_penalty)
         )
-    if measure == "WMT23":
+    if measure == "WMT25":
         return lambda pred, ref: (
             float(overlap_length(pred, ref))
             * severity_reward(pred, ref, severity_penalty)
